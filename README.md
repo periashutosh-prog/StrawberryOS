@@ -135,10 +135,7 @@ MIT License — do whatever you want, just keep it open.
 
 ## 👤 Author
 
-**Ashutosh** — 8th grade student, maker, and engineer from Coimbatore, India.  
-Built during exam season with a hidden PC cable and a Dairy Milk. 🍫
-
-> *"When everything seems to be going against you, remember that the airplane takes off against the wind, not with it."*
+**Ashutosh** — Student, maker, and embedded systems engineer from Coimbatore, India.
 
 ---
 
