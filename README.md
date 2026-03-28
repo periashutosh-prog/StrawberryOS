@@ -1,7 +1,5 @@
 # 🍓 StrawberryWatchOS
 
-> `StrawberryOS != (WatchOS || Money)`  
-> `StrawberryOS = (Helping && Brotherhood && OpenSource)`
 
 An open-source smartwatch operating system built on ESP32, designed to be hackable, extensible, and free for everyone.
 
