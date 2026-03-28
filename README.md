@@ -1,7 +1,7 @@
 # StrawberryOS
 
 
-An open-source embedded operating system built on ESP32, designed to be hackable, extensible, and free for everyone.
+An open-source embedded operating system built on ESP32, designed to be hackable, extensible, and free for everyone. Orginally, it's designed for a smartwatch but with some modifications it can be used for almost any device.
 
 ---
 
