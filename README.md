@@ -129,14 +129,12 @@ No experience required. If you're a hobbyist who got stuck — this project exis
 
 ## 📜 License
 
-MIT License — do whatever you want, just keep it open.
+MIT License — For customising the OS to your own needs. Just keep it open source too :)
 
 ---
 
 ## 👤 Author
 
-**Ashutosh** — Student, maker, and embedded systems engineer from Coimbatore, India.
+**Ashutosh** — Student, maker, and an average guy who wants to build complex stuff on his own...
 
 ---
-
-*StrawberryOS is part of the Strawberry ecosystem — sPhone, StrawberryWatchOS, and more. All open source. Always.*
