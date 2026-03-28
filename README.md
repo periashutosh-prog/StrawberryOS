@@ -1,59 +1,59 @@
-# 🍓 StrawberryWatchOS
+# StrawberryOS
 
 
-An open-source smartwatch operating system built on ESP32, designed to be hackable, extensible, and free for everyone.
-
----
-
-## 🧠 What is StrawberryWatchOS?
-
-StrawberryWatchOS is a full smartwatch OS built from scratch for the XIAO ESP32-C6, running on a 0.96" SSD1306 OLED display. It is part of the broader **Strawberry ecosystem** — an open-source platform for embedded devices.
-
-This is not a commercial product. It is a platform — built so that hobbyists, engineers, and makers are never bottlenecked by budget, time, or closed ecosystems.
+An open-source embedded operating system built on ESP32, designed to be hackable, extensible, and free for everyone.
 
 ---
 
-## ⚙️ Hardware
+## 🍓 What is StrawberryOS?
+
+StrawberryOS is a full embedded OS built from scratch for the Seeed XIAO ESP32-C6, currently targeting smartwatch hardware. It is part of the broader **Strawberry ecosystem** — an open-source platform for embedded devices.
+
+This is not a commercial product. It is a platform built so that hobbyists, engineers, and makers are never bottlenecked by budget, time, or closed ecosystems. The core is designed to be portable — anyone can fork StrawberryOS, modify the app layer, and deploy it on their own hardware.
+
+---
+
+## ⚙️ Hardware Reference Design
 
 | Component | Details |
 |---|---|
 | MCU | Seeed XIAO ESP32-C6 (RISC-V 160MHz, WiFi 6, BLE 5.3) |
-| Display | 0.96" SSD1306 OLED (128×64) |
+| Display | 0.96" SSD1306 OLED (128x64, I2C) |
 | RTC | DS3231 |
 | Battery | 1500mAh LiPo |
-| Buttons | 5× tactile (UP, DOWN, LEFT, RIGHT, CENTER) |
+| Input | 5x tactile buttons (UP, DOWN, LEFT, RIGHT, CENTER) |
 | PCB | Custom 6-layer ENIG |
-| Enclosure | 52×32mm ASA |
+| Enclosure | 52x32mm ASA |
 
-> Dev board: ESP32-C3 SuperMini (pin-compatible for development)
+> Development board: ESP32-C3 SuperMini (pin-compatible for prototyping)
 
 ---
 
 ## ✨ Features
 
 ### Currently Implemented
-- ⌚ Watch face with real-time clock (DS3231 RTC)
-- 📅 Date and day of week display
-- ⏱️ Stopwatch (MM:SS:ms)
-- ⏲️ Countdown Timer with alert
-- 📡 Radio app (WiFi, BLE, ESP-NOW stubs)
-- 🌐 WiFi scanning, credential saving (up to 5 networks)
-- 🕐 NTP time sync over WiFi
-- 🔋 Display timeout + power management
-- 🎞️ Smooth slide animations between screens
-- ⌨️ On-screen keyboard (lower, upper, symbol modes)
-- 🔘 FreeRTOS button input task
+- Watch face with real-time clock via DS3231 RTC
+- Date and day of week display
+- Stopwatch with millisecond precision (MM:SS:ms)
+- Countdown timer with alert
+- Radio app with WiFi, BLE, and ESP-NOW stubs
+- WiFi network scanning and credential management (up to 5 networks)
+- NTP time synchronization over WiFi
+- Display timeout and basic power management
+- Smooth slide transition animations between screens
+- On-screen keyboard (lowercase, uppercase, symbol modes)
+- FreeRTOS-based button input task
 
 ### Planned
-- 📲 BLE phone notifications
-- 🏓 ESP-NOW multiplayer (Pong, named device discovery)
-- 🤖 Groq AI assistant (on-device chat via WiFi)
-- 🌦️ Weather app
-- 💬 WhatsUp P2P messaging
-- 💀 BSOD heap watchdog
-- 🔁 Daily 3AM silent reboot
-- 📁 LittleFS chat history
-- 😴 Light sleep eco mode (~31 days battery)
+- BLE phone notifications
+- ESP-NOW multiplayer with named device discovery
+- Groq AI assistant via WiFi
+- Weather application
+- WhatsUp P2P messaging integration
+- Heap watchdog with BSOD error screen
+- Daily silent reboot for memory maintenance
+- LittleFS-based chat history
+- Light sleep eco mode (target: 31 days battery life)
 
 ---
 
@@ -66,26 +66,26 @@ StrawberryOS (Universal Core)
 ├── ESP-NOW stack
 ├── Power management
 └── App layer (device specific)
-    └── StrawberryWatchOS (this repo)
+    └── Smartwatch (current reference implementation)
 ```
 
-StrawberryOS is designed to be ported. The core is hardware-agnostic — build your own app layer for your own device.
+StrawberryOS is designed to be portable. The core is hardware-agnostic. Developers can build their own app layer for their own target device.
 
 ---
 
 ## 🔋 Power Modes
 
-| Mode | Description | Battery Life |
+| Mode | Description | Estimated Battery Life |
 |---|---|---|
-| Normal | All radios active, full brightness | ~1.5 days |
-| Eco | Display off, light sleep, wake on button | ~31 days |
+| Normal | All radios active, full display brightness | ~1.5 days |
+| Eco | Display off, light sleep, wake on button press | ~31 days |
 
 ---
 
 ## 🚀 Getting Started
 
 ### Requirements
-- Arduino IDE or PlatformIO (AntiGravity IDE recommended)
+- Arduino IDE, PlatformIO, or AntiGravity IDE
 - ESP32 Arduino Core
 - Libraries:
   - `Adafruit SSD1306`
@@ -94,10 +94,10 @@ StrawberryOS is designed to be ported. The core is hardware-agnostic — build y
   - `ArduinoJson`
   - `LittleFS`
 
-### Flash
-1. Clone this repo
+### Flashing
+1. Clone this repository
 2. Open `Smartwatch.ino` in your IDE
-3. Select board: `XIAO ESP32-C6` (or `ESP32-C3` for dev)
+3. Select board: `Seeed XIAO ESP32-C6` (or `ESP32-C3 SuperMini` for development)
 4. Upload
 
 ---
@@ -105,34 +105,32 @@ StrawberryOS is designed to be ported. The core is hardware-agnostic — build y
 ## 📁 File Structure
 
 ```
-StrawberryWatchOS/
-├── Smartwatch.ino       # Main OS file
+StrawberryOS/
+├── Smartwatch.ino        # Main OS source
 ├── README.md
-└── (PCB files coming soon)
+└── PCB/                  # EasyEDA files (coming soon)
 ```
 
 ---
 
 ## 🤝 Contributing
 
-StrawberryOS is open to everyone.
+StrawberryOS is open to all contributors.
 
-- Found a bug? Open an issue
-- Want a feature? Fork and PR
-- Porting to another device? Document it and share
+- Found a bug? Open an issue.
+- Want a feature? Fork the repository and submit a pull request.
+- Porting to a different device? Document your changes and share them with the community.
 
-No experience required. If you're a hobbyist who got stuck — this project exists because the developer got stuck too.
+No minimum experience required. This project exists so that no developer has to start from scratch.
 
 ---
 
 ## 📜 License
 
-MIT License — For customising the OS to your own needs. Just keep it open source too :)
+MIT License — You are free to use, modify, and distribute this project. Keeping derivatives open source is encouraged.
 
 ---
 
 ## 👤 Author
 
 **Ashutosh** — Student, maker, and an average guy who wants to build complex stuff on his own...
-
----
