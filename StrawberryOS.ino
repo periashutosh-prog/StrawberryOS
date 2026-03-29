@@ -12,6 +12,10 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+#include <LittleFS.h>
+#include <WiFiClientSecure.h>
 
 // OLED Display Configuration
 #define SCREEN_WIDTH 128
@@ -45,8 +49,13 @@ enum ScreenState {
   SCREEN_RADIO_WIFI, SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING,
   SCREEN_WIFI_RESULTS, SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD,
   SCREEN_WIFI_HOME, SCREEN_WIFI_TOGGLE_CONFIRM,
-  SCREEN_RADIO_BLE, SCREEN_RADIO_ESPNOW, SCREEN_RADIO_POWER,
-  SCREEN_WIFI_NTP
+  SCREEN_RADIO_BLE, SCREEN_RADIO_BLE_CONFIRM, SCREEN_RADIO_ESPNOW,
+  // Power Mode
+  SCREEN_POWER_HOME, SCREEN_WIFI_AUTO_CONFIRM, SCREEN_ESPNOW_AUTO_CONFIRM,
+  SCREEN_POWER_MODE, SCREEN_POWER_MODE_HELP, SCREEN_ECO_EXIT_CONFIRM,
+  SCREEN_WIFI_NTP,
+  // AI Chatbot
+  SCREEN_AI_CHAT, SCREEN_AI_THINKING
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
@@ -55,8 +64,8 @@ bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
 
 // Menu State
-const int NUM_MENU_ITEMS = 4;
-const char* menuItems[NUM_MENU_ITEMS] = {"Stopwatch", "Timer", "Radio", "Lock"};
+const int NUM_MENU_ITEMS = 5;
+const char* menuItems[NUM_MENU_ITEMS] = {"Stopwatch", "Timer", "Radio", "AI Chat", "Lock"};
 int menuIndex = 0;
 
 // Stopwatch State
@@ -103,23 +112,26 @@ int kbCursorRow = 0, kbCursorCol = 0;
 const char* kbLower[4][11] = {
   {"q","w","e","r","t","y","u","i","o","p","."},
   {"a","s","d","f","g","h","j","k","l",",","?"},
-  {"z","x","c","v","b","n","m","!","^","^","<"},
+  {"z","x","c","v","b","n","m","CL","CR","^","BS"},
   {"1","2","3","4","5","6","7","8","9"," ","EN"}
 };
 const char* kbUpper[4][11] = {
   {"Q","W","E","R","T","Y","U","I","O","P","."},
   {"A","S","D","F","G","H","J","K","L",",","?"},
-  {"Z","X","C","V","B","N","M","!","^","^","<"},
+  {"Z","X","C","V","B","N","M","CL","CR","^","BS"},
   {"!","@","#","$","%","^","&","*","("," ","EN"}
 };
 const char* kbSymbol[4][11] = {
   {"1","2","3","4","5","6","7","8","9","0","~"},
   {"@","$","%","&","*","-","+","=","!","|","\\"},
-  {"/","?",";",":","'","(",")","#","^","^","<"},
-  {"[","]","{","}","<",">","^","_","."," ","EN"}
+  {"/","?",";",":","'","(",")","CL","CR","^","BS"},
+  {"[","]","{","}","<",">","#","_","."," ","EN"}
 };
 
 // --- WiFi ---
+bool wifiAutoOn = false;
+bool espNowAutoOn = false;
+String lastConnectedSSID = "";
 bool wifiEnabled = false;
 int wifiScanResults = 0;
 int wifiListIndex = -1; // -1 = back selected
@@ -141,7 +153,20 @@ int wifiRetryCount = 0;
 
 // Input buffer for keyboard
 String kbInputBuffer = "";
+int kbTextCursor = 0;
+int kbScrollOffset = 0;
 ScreenState kbReturnScreen = SCREEN_WIFI_PASSWORD;
+
+// --- BLE ---
+BLEServer* pBleServer = NULL;
+BLECharacteristic* pBleNameCharacteristic = NULL;
+bool bleConnected = false;
+String bleDeviceName = "Ashutosh's Smartwatch";
+String bleRemoteDeviceName = "None";
+bool bleSettingAccess = false;
+int bleHomeCursor = 0; // 0=Name, 1=Setting Access (if connected)
+int bleConfirmMode = 0; // 0=Rename, 1=Disconnect, 2=Forget, 3=SettingToggle
+int bleConfirmCursor = 0; // 0=YES, 1=NO
 
 // --- Saved credentials (up to 5 networks) ---
 Preferences prefs;
@@ -161,7 +186,37 @@ const long gmtOffset_sec = 19800; // IST = UTC+5:30
 const int daylightOffset_sec = 0;
 
 // Radio home cursor
-int radioCursor = 0; // 0=WiFi,1=BLE,2=ESP-NOW,3=Power
+int radioCursor = 0; // 0=WiFi,1=BLE,2=ESP-NOW
+int powerHomeCursor = 0; // 0=WiFi Auto, 1=ESP-NOW Auto, 2=Eco Mode
+
+// Power Mode State
+enum PowerModeType { POWER_NORMAL, POWER_ECO };
+PowerModeType currentPowerMode = POWER_NORMAL;
+int powerModeButtonCursor = 0; // 0=Yes, 1=Help, 2=No
+bool ecoModeActive = false;
+unsigned long ecoModeSleepStart = 0;
+const unsigned long ECO_MODE_SLEEP_DURATION = 5000; // 5 seconds
+unsigned long ecoExitPressStart = 0; // Track center button press time for Eco exit
+const unsigned long ECO_EXIT_PRESS_DURATION = 5000; // 5 seconds to exit
+int ecoExitConfirmCursor = 1; // -1=Back, 0=Yes, 1=No (default to No)
+unsigned long ecoDeepSleepStart = 0;
+const unsigned long ECO_DEEP_SLEEP_DELAY = 500; // 500ms after display off before deep sleep
+
+// --- AI Chatbot ---
+int aiMsgCount = 0;
+int aiChatScroll = 0;
+bool aiScrollMode = false;
+int aiCursor = 0;           // -2=back, -1=clear(C), 0=chat, 1=input, 2=send
+String aiInputText = "";
+bool aiThinking = false;
+unsigned long aiThinkStart = 0;
+String aiResponse = "";
+volatile bool aiResponseReady = false;
+volatile bool aiResponseError = false;
+const char* GROQ_API_KEY = "YOUR_GROQ_API_KEY";
+const int AI_MAX_MESSAGES = 500;
+String aiCache[5];          // Cache visible messages
+int aiCacheScrollUsed = -1; // Track which scroll offset is cached
 
 // Prototypes
 void updateDisplay();
@@ -175,6 +230,15 @@ void drawTimerAlert(int yOffset);
 void drawCenteredText(Adafruit_SSD1306 &d, const String &text, int16_t y, uint8_t size = 1);
 void drawBoxedCenteredText(Adafruit_SSD1306 &d, const char* text, int x, int y, int w, int h, bool inverted);
 void startAnimation(ScreenState next, int targetOffset);
+// AI Chatbot prototypes
+int aiCountMessages();
+void aiAddMessage(const String& msg);
+void aiClearChat();
+String aiGetMessage(int index);
+void drawAiChat(int yOffset);
+void drawAiThinking(int yOffset);
+void aiSendTask(void* param);
+void aiUpdateCache();
 void buttonReadTask(void *pvParameters);
 void printButtonStates();
 // Radio prototypes
@@ -188,6 +252,12 @@ void drawWifiKeyboard();
 void drawWifiHome(int yOffset);
 void drawWifiToggleConfirm(int yOffset);
 void drawRadioStub(int yOffset, const char* name);
+void drawRadioBleHome(int yOffset);
+void drawBleConfirm(int yOffset);
+void drawPowerModeSelection(int yOffset);
+void drawPowerModeHelp(int yOffset);
+void drawEcoExitConfirm(int yOffset);
+void initBLE();
 void loadCredentials();
 void saveCredential(String ssid, String pwd);
 void forgetCredential(String ssid);
@@ -217,9 +287,9 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.println("Initializing...");
+  // Skip initialization message
   display.display();
-  delay(500);
+  delay(100);
   
   // Initialize RTC
   if (!rtc.begin()) {
@@ -256,11 +326,49 @@ void setup() {
   // Load saved WiFi credentials from NVS
   loadCredentials();
   
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Force maximum radio transmit power (19.5 decibels) to punch through hardware interference! 
+  WiFi.setSleep(true); // Enable modem sleep to save battery
+  WiFi.disconnect(true); // Ensure no ghost connection from previous boots
+  delay(100);
+  
   // Start internet pinger tasks
   startWifiPingers();
   
-  // Enable Modem Sleep for power saving
-  WiFi.setSleep(true);
+  // Initialize BLE
+  initBLE();
+  
+  // Load Power mode settings
+  prefs.begin("powermode", false);
+  ecoModeActive = prefs.getBool("ecoMode", false);
+  wifiAutoOn = prefs.getBool("wifiAutoOn", false);
+  espNowAutoOn = prefs.getBool("espNowAutoOn", false);
+  lastConnectedSSID = prefs.getString("lastSSID", "");
+  prefs.end();
+
+  // Initialize LittleFS for AI chat storage
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+  }
+  aiMsgCount = aiCountMessages();
+  aiUpdateCache();
+
+  // If WiFi Auto On is enabled, set wifiEnabled to true so background task starts
+  if (wifiAutoOn) {
+    wifiEnabled = true;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(); // Start driver
+  }
+
+  // Create FreeRTOS task for background WiFi
+  xTaskCreate(
+    wifiBackgroundTask,
+    "WiFiBack",
+    4096,
+    NULL,
+    1,
+    NULL
+  );
   
   lastActivityTime = millis();
 }
@@ -278,6 +386,7 @@ void loop() {
   // Handle Display Wake/Sleep
   if (activityDetected) {
     lastActivityTime = millis();
+    if (ecoModeActive) ecoModeSleepStart = millis();
     if (!displayOn) {
       display.ssd1306_command(SSD1306_DISPLAYON);
       displayOn = true;
@@ -296,12 +405,58 @@ void loop() {
                       (currentScreen == SCREEN_TIMER_ALERT) ||
                       (currentScreen == SCREEN_WIFI_SCANNING) ||
                       (currentScreen == SCREEN_WIFI_PASSWORD && wifiConnecting) ||
-                      (currentScreen == SCREEN_WIFI_NTP);
+                      (currentScreen == SCREEN_WIFI_NTP) ||
+                      (currentScreen == SCREEN_AI_THINKING);
 
   if (displayOn && !inhibitSleep) {
-    if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
-      display.ssd1306_command(SSD1306_DISPLAYOFF);
-      displayOn = false;
+    // Eco mode: check eco sleep timer
+    if (ecoModeActive && currentScreen == SCREEN_WATCHFACE) {
+      if (millis() - ecoModeSleepStart > ECO_MODE_SLEEP_DURATION) {
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
+        displayOn = false;
+        ecoDeepSleepStart = millis();
+      }
+    } else {
+      // Normal mode: check activity timeout
+      if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
+        displayOn = false;
+      }
+    }
+  }
+
+  // Eco mode: enter deep sleep after display off
+  if (!displayOn && ecoModeActive && currentScreen == SCREEN_WATCHFACE) {
+    if (millis() - ecoDeepSleepStart > ECO_DEEP_SLEEP_DELAY) {
+      // Disable WiFi, BLE, and other radios to save power
+      WiFi.disconnect(true); // poweroff = true
+      WiFi.mode(WIFI_OFF);
+      esp_bt_controller_disable();
+      
+      // Ensure button pins are configured as inputs with pull-ups (RTC domain)
+      gpio_set_direction((gpio_num_t)BTN_UP, GPIO_MODE_INPUT);
+      gpio_set_direction((gpio_num_t)BTN_DOWN, GPIO_MODE_INPUT);
+      gpio_set_direction((gpio_num_t)BTN_LEFT, GPIO_MODE_INPUT);
+      gpio_set_direction((gpio_num_t)BTN_RIGHT, GPIO_MODE_INPUT);
+      gpio_set_direction((gpio_num_t)BTN_CENTER, GPIO_MODE_INPUT);
+      
+      // Enable pull-ups via RTC domain GPIO
+      gpio_pullup_en((gpio_num_t)BTN_UP);
+      gpio_pullup_en((gpio_num_t)BTN_DOWN);
+      gpio_pullup_en((gpio_num_t)BTN_LEFT);
+      gpio_pullup_en((gpio_num_t)BTN_RIGHT);
+      gpio_pullup_en((gpio_num_t)BTN_CENTER);
+      
+      // Configure GPIO wake-up for all buttons (active low) using RTC domain
+      esp_sleep_enable_gpio_wakeup();
+      gpio_wakeup_enable((gpio_num_t)BTN_UP, GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)BTN_DOWN, GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)BTN_LEFT, GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)BTN_RIGHT, GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)BTN_CENTER, GPIO_INTR_LOW_LEVEL);
+      
+      // Enter deep sleep
+      esp_deep_sleep_start();
     }
   }
 
@@ -363,6 +518,28 @@ void loop() {
     }
   }
 
+  // Poll AI Thinking response
+  if (currentScreen == SCREEN_AI_THINKING && !isAnimating) {
+    lastActivityTime = millis();
+    if (aiResponseReady) {
+      aiResponseReady = false;
+      aiAddMessage("A:" + aiResponse);
+      aiResponse = "";
+      aiChatScroll = max(0, aiMsgCount - 4);
+      aiUpdateCache();
+      startAnimation(SCREEN_AI_CHAT, -64);
+    } else if (aiResponseError) {
+      aiResponseError = false;
+      aiAddMessage("A:Internet Error");
+      aiChatScroll = max(0, aiMsgCount - 4);
+      startAnimation(SCREEN_AI_CHAT, -64);
+    } else if (millis() - aiThinkStart > 10000) {
+      aiAddMessage("A:Timeout (10s)");
+      aiChatScroll = max(0, aiMsgCount - 4);
+      startAnimation(SCREEN_AI_CHAT, -64);
+    }
+  }
+
   // Only process UI if display is on
   if (displayOn) {
     // Handle Animations
@@ -378,7 +555,30 @@ void loop() {
     } else {
       // Handle Input based on current screen
       if (currentScreen == SCREEN_WATCHFACE) {
-        if (buttonJustPressed[0]) { // UP button -> Menu
+        // In Eco mode, any button wakes and resets sleep timer
+        if (ecoModeActive && (buttonJustPressed[0] || buttonJustPressed[1] || buttonJustPressed[2] 
+                              || buttonJustPressed[3] || buttonJustPressed[4])) {
+          ecoModeSleepStart = millis();
+        }
+        
+        // In Eco mode, track center button press for long press exit
+        if (ecoModeActive && buttonStates[4]) { // CENTER button is held
+          if (ecoExitPressStart == 0) {
+            ecoExitPressStart = millis();
+          }
+          // Check if button held for 5 seconds
+          if (millis() - ecoExitPressStart >= ECO_EXIT_PRESS_DURATION) {
+            ecoExitConfirmCursor = 1; // Default to "No"
+            startAnimation(SCREEN_ECO_EXIT_CONFIRM, -64);
+            ecoExitPressStart = 0; // Reset
+          }
+        } else {
+          // Button released, reset timer
+          ecoExitPressStart = 0;
+        }
+        
+        // Only allow menu access if NOT in Eco mode
+        if (!ecoModeActive && buttonJustPressed[0]) { // UP button -> Menu
           startAnimation(SCREEN_MENU, -64); // Slide up
         }
       } 
@@ -400,7 +600,13 @@ void loop() {
         } else if (menuIndex == 2) { // Radio
           radioCursor = 0;
           startAnimation(SCREEN_RADIO, -64);
-        } else if (menuIndex == 3) { // Lock
+        } else if (menuIndex == 3) { // AI Chat
+          aiCursor = 0;
+          aiScrollMode = false;
+          aiChatScroll = max(0, aiMsgCount - 4);
+          aiUpdateCache();
+          startAnimation(SCREEN_AI_CHAT, -64);
+        } else if (menuIndex == 4) { // Lock
           startAnimation(SCREEN_WATCHFACE, 64);
         }
         }
@@ -585,7 +791,7 @@ void loop() {
     // =========================================
     // RADIO APP NAVIGATION
     // =========================================
-    if (currentScreen == SCREEN_RADIO) {
+    else if (currentScreen == SCREEN_RADIO) {
       if (buttonJustPressed[0]) { if (radioCursor > -1) radioCursor--; } // Allow going up to -1 (the <-- button)
       if (buttonJustPressed[1]) { if (radioCursor < 3) radioCursor++; }
       if (buttonJustPressed[2]) {
@@ -597,31 +803,339 @@ void loop() {
         }
         else if (radioCursor == 0) {
           if (WiFi.status() == WL_CONNECTED) { wifiHomeCursor = 0; startAnimation(SCREEN_WIFI_HOME, -64); }
+          else if (wifiAutoOn || wifiEnabled) {
+            // Join an active scan if one is already running, otherwise start a new one
+            if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+              wifiScanStart = millis();
+              wifiScanResults = -1;
+              startAnimation(SCREEN_WIFI_SCANNING, -64);
+            } else {
+              WiFi.scanDelete(); 
+              WiFi.disconnect(); 
+              vTaskDelay(pdMS_TO_TICKS(100));
+              WiFi.scanNetworks(true, false, false, 250);
+              wifiScanStart = millis();
+              wifiScanResults = -1;
+              startAnimation(SCREEN_WIFI_SCANNING, -64);
+            }
+          }
           else { wifiConfirmCursor = 0; startAnimation(SCREEN_RADIO_WIFI, -64); }
         } else if (radioCursor == 1) startAnimation(SCREEN_RADIO_BLE, -64);
         else if (radioCursor == 2) startAnimation(SCREEN_RADIO_ESPNOW, -64);
-        else if (radioCursor == 3) startAnimation(SCREEN_RADIO_POWER, -64);
+        else if (radioCursor == 3) {
+          powerHomeCursor = 0;
+          startAnimation(SCREEN_POWER_HOME, -64);
+        }
       }
-    }    else if (currentScreen == SCREEN_RADIO_WIFI) {
-      if (buttonJustPressed[0]) wifiConfirmCursor = -1; // UP = back
-      if (buttonJustPressed[1]) { if (wifiConfirmCursor == -1) wifiConfirmCursor = 0; } // DOWN = YES
-      if (buttonJustPressed[3]) wifiConfirmCursor = 1; // RIGHT = NO
+    }
+    else if (currentScreen == SCREEN_POWER_HOME) {
+      if (buttonJustPressed[0]) { if (powerHomeCursor > -1) powerHomeCursor--; }
+      if (buttonJustPressed[1]) { if (powerHomeCursor < 2) powerHomeCursor++; }
+      if (buttonJustPressed[4]) {
+        if (powerHomeCursor == -1) startAnimation(SCREEN_RADIO, 64);
+        else if (powerHomeCursor == 0) { 
+          wifiConfirmCursor = wifiAutoOn ? 1 : 0; 
+          startAnimation(SCREEN_WIFI_AUTO_CONFIRM, -64); 
+        }
+        else if (powerHomeCursor == 1) { 
+          wifiConfirmCursor = espNowAutoOn ? 1 : 0; // reusing cursor
+          startAnimation(SCREEN_ESPNOW_AUTO_CONFIRM, -64); 
+        }
+        else if (powerHomeCursor == 2) {
+          powerModeButtonCursor = 2; // Default to NO
+          startAnimation(SCREEN_POWER_MODE, -64);
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_WIFI_AUTO_CONFIRM) {
+      if (buttonJustPressed[0]) wifiConfirmCursor = -1;
+      if (buttonJustPressed[1] && wifiConfirmCursor == -1) wifiConfirmCursor = 0;
+      if (buttonJustPressed[2] && wifiConfirmCursor != -1) wifiConfirmCursor = 0;
+      if (buttonJustPressed[3] && wifiConfirmCursor != -1) wifiConfirmCursor = 1;
+      if (buttonJustPressed[4]) {
+        if (wifiConfirmCursor == -1) startAnimation(SCREEN_POWER_HOME, 64);
+        else {
+          wifiAutoOn = (wifiConfirmCursor == 0);
+          prefs.begin("powermode", false);
+          prefs.putBool("wifiAutoOn", wifiAutoOn);
+          prefs.end();
+          startAnimation(SCREEN_POWER_HOME, 64);
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_ESPNOW_AUTO_CONFIRM) {
+      if (buttonJustPressed[0]) wifiConfirmCursor = -1;
+      if (buttonJustPressed[1] && wifiConfirmCursor == -1) wifiConfirmCursor = 0;
+      if (buttonJustPressed[2] && wifiConfirmCursor != -1) wifiConfirmCursor = 0;
+      if (buttonJustPressed[3] && wifiConfirmCursor != -1) wifiConfirmCursor = 1;
+      if (buttonJustPressed[4]) {
+        if (wifiConfirmCursor == -1) startAnimation(SCREEN_POWER_HOME, 64);
+        else {
+          espNowAutoOn = (wifiConfirmCursor == 0);
+          prefs.begin("powermode", false);
+          prefs.putBool("espNowAutoOn", espNowAutoOn);
+          prefs.end();
+          startAnimation(SCREEN_POWER_HOME, 64);
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_RADIO_BLE) {
+      if (buttonJustPressed[0]) { if (bleHomeCursor > -1) bleHomeCursor--; }
+      if (buttonJustPressed[1]) { 
+        int maxCur = bleConnected ? 1 : 0;
+        if (bleHomeCursor < maxCur) bleHomeCursor++; 
+      }
+      if (buttonJustPressed[4]) {
+        if (bleHomeCursor == -1) startAnimation(SCREEN_RADIO, 64);
+        else if (!bleConnected) {
+          startAnimation(SCREEN_RADIO, 64);
+        } else {
+          if (bleHomeCursor == 0) {
+            kbInputBuffer = bleDeviceName;
+            kbTextCursor = kbInputBuffer.length();
+            kbScrollOffset = 0;
+            kbReturnScreen = SCREEN_RADIO_BLE;
+            kbCursorRow = 0; kbCursorCol = 0;
+            currentKBMode = KB_LOWER;
+            currentScreen = SCREEN_WIFI_KEYBOARD; 
+          } else if (bleHomeCursor == 1) { // Setting
+            bleConfirmMode = 3; bleConfirmCursor = 0;
+            startAnimation(SCREEN_RADIO_BLE_CONFIRM, -64);
+          }
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_RADIO_BLE_CONFIRM) {
+      if (buttonJustPressed[0]) { bleConfirmCursor = -1; } // UP = back arrow
+      if (buttonJustPressed[2]) { if (bleConfirmCursor != -1) bleConfirmCursor = 0; } // LEFT = YES
+      if (buttonJustPressed[3]) { if (bleConfirmCursor != -1) bleConfirmCursor = 1; } // RIGHT = NO
+      if (buttonJustPressed[1]) { if (bleConfirmCursor == -1) bleConfirmCursor = 0; } // DOWN = enter buttons
+      if (buttonJustPressed[4]) {
+        if (bleConfirmCursor == -1 || bleConfirmCursor == 1) { // Back or NO
+          startAnimation(SCREEN_RADIO_BLE, 64);
+        } else if (bleConfirmCursor == 0) {
+          if (bleConfirmMode == 0) {
+            bleDeviceName = kbInputBuffer;
+            saveBleSettings();
+            // Re-advertise with new name using standard library call
+            BLEDevice::getAdvertising()->stop();
+            BLEDevice::getAdvertising()->setName(bleDeviceName.c_str());
+            BLEDevice::getAdvertising()->start();
+          } else if (bleConfirmMode == 1 || bleConfirmMode == 2) {
+            // Safe disconnect: close all active connections by ID range
+            bleConnected = false;
+            bleHomeCursor = 0; // Focus OK on return
+            if (pBleServer) {
+              uint16_t numClients = pBleServer->getConnectedCount();
+              for (uint16_t i = 0; i < numClients; i++) {
+                pBleServer->disconnect(i);
+              }
+              BLEDevice::getAdvertising()->stop();
+              delay(100);
+              BLEDevice::getAdvertising()->start();
+            }
+          } else if (bleConfirmMode == 3) {
+            bleSettingAccess = !bleSettingAccess;
+            saveBleSettings();
+          }
+          startAnimation(SCREEN_RADIO_BLE, 64);
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_RADIO_WIFI) {
+      if (buttonJustPressed[0]) wifiConfirmCursor = -1;
+      if (buttonJustPressed[1]) { if (wifiConfirmCursor == -1) wifiConfirmCursor = 0; }
+      if (buttonJustPressed[3]) wifiConfirmCursor = 1;
       if (buttonJustPressed[2]) { if (wifiConfirmCursor == 1) wifiConfirmCursor = 0; }
       if (buttonJustPressed[4]) {
         if (wifiConfirmCursor == 0) {
-          WiFi.disconnect(); // Ensure clean state
+          wifiEnabled = true;
+          wifiStatusMsg = ""; // Reset status
+          wifiRetryCount = 0; // Reset retries
           WiFi.mode(WIFI_STA);
-          // 250ms per channel * 14 channels ≈ 3.5 seconds
-          WiFi.scanNetworks(true, false, false, 250);
-          wifiScanStart = millis();
-          wifiScanResults = -1;
-          startAnimation(SCREEN_WIFI_SCANNING, -64);
-        } else if (wifiConfirmCursor == 1) {
-          startAnimation(SCREEN_RADIO, 64);
+          
+          // Clear any previous scan results to ensure we get fresh ones
+          WiFi.scanDelete();
+          
+          // Wait for any existing scan to settle if needed
+          if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+            wifiScanStart = millis();
+            wifiScanResults = -1;
+            startAnimation(SCREEN_WIFI_SCANNING, -64);
+          } else {
+            WiFi.disconnect(); 
+            vTaskDelay(pdMS_TO_TICKS(100)); // Yield to driver
+            WiFi.scanNetworks(true); // Async scan
+            wifiScanStart = millis();
+            wifiScanResults = -1;
+            startAnimation(SCREEN_WIFI_SCANNING, -64);
+          }
         } else {
           startAnimation(SCREEN_RADIO, 64);
         }
       }
+    }
+    else if (currentScreen == SCREEN_WIFI_SCANNING) {
+      if (wifiScanResults <= -1) {
+        wifiScanResults = WiFi.scanComplete();
+        if (wifiScanResults >= 0) {
+          wifiListIndex = 0;
+          wifiListScroll = 0;
+          startAnimation(SCREEN_WIFI_RESULTS, -64);
+        } else if (wifiScanResults == -2) { // Failed
+           // Retry once or show no networks
+           wifiScanResults = 0;
+           startAnimation(SCREEN_WIFI_RESULTS, -64);
+        } else if (millis() - wifiScanStart > 10000) {
+          wifiScanResults = 0;
+          startAnimation(SCREEN_WIFI_RESULTS, -64);
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_RADIO_ESPNOW) {
+      if (buttonJustPressed[4]) startAnimation(SCREEN_RADIO, 64);
+    }
+
+    else if (currentScreen == SCREEN_POWER_MODE) {
+      if (buttonJustPressed[0]) powerModeButtonCursor = -1; // back arrow
+      if (buttonJustPressed[1] && powerModeButtonCursor == -1) powerModeButtonCursor = 2; // to NO
+      if (buttonJustPressed[2]) { // LEFT
+        if (powerModeButtonCursor > 0) powerModeButtonCursor--;
+      }
+      if (buttonJustPressed[3]) { // RIGHT
+        if (powerModeButtonCursor < 2) powerModeButtonCursor++;
+      }
+      if (buttonJustPressed[4]) { // CENTER (Click)
+        if (powerModeButtonCursor == -1) {
+          startAnimation(SCREEN_POWER_HOME, 64);
+        } else if (powerModeButtonCursor == 0) { // Yes - Enable Eco
+          currentPowerMode = POWER_ECO;
+          ecoModeActive = true;
+          // Save Eco mode state to preferences
+          prefs.begin("powermode", false);
+          prefs.putBool("ecoMode", true);
+          prefs.end();
+          ecoModeSleepStart = millis();
+          startAnimation(SCREEN_WATCHFACE, 64);
+        } else if (powerModeButtonCursor == 1) { // Help
+          startAnimation(SCREEN_POWER_MODE_HELP, -64);
+        } else if (powerModeButtonCursor == 2) { // No - Stay Normal
+          startAnimation(SCREEN_POWER_HOME, 64);
+        }
+      }
+    }
+
+    else if (currentScreen == SCREEN_POWER_MODE_HELP) {
+      if (buttonJustPressed[4]) { // CENTER (Click)
+        startAnimation(SCREEN_POWER_MODE, 64); // Go back to power mode selection
+      }
+    }
+
+    else if (currentScreen == SCREEN_ECO_EXIT_CONFIRM) {
+      if (buttonJustPressed[0]) { // UP -> Back
+        if (ecoExitConfirmCursor != -1) ecoExitConfirmCursor = -1;
+      }
+      if (buttonJustPressed[1]) { // DOWN -> to buttons
+        if (ecoExitConfirmCursor == -1) ecoExitConfirmCursor = 1; // Default to No
+      }
+      if (buttonJustPressed[2]) { // LEFT -> Yes
+        if (ecoExitConfirmCursor != -1) ecoExitConfirmCursor = 0;
+      }
+      if (buttonJustPressed[3]) { // RIGHT -> No
+        if (ecoExitConfirmCursor != -1) ecoExitConfirmCursor = 1;
+      }
+      if (buttonJustPressed[4]) { // CENTER (Click)
+        if (ecoExitConfirmCursor == -1) { // Back
+          startAnimation(SCREEN_WATCHFACE, 64);
+        } else if (ecoExitConfirmCursor == 0) { // Yes
+          // Exit Eco Mode
+          currentPowerMode = POWER_NORMAL;
+          ecoModeActive = false;
+          // Save Eco mode state to preferences
+          prefs.begin("powermode", false);
+          prefs.putBool("ecoMode", false);
+          prefs.end();
+          ecoExitPressStart = 0;
+          startAnimation(SCREEN_WATCHFACE, 64);
+        } else if (ecoExitConfirmCursor == 1) { // No
+          startAnimation(SCREEN_WATCHFACE, 64);
+        }
+      }
+    }
+
+    // =========================================
+    // AI CHATBOT NAVIGATION
+    // =========================================
+    else if (currentScreen == SCREEN_AI_CHAT) {
+      if (aiScrollMode) {
+        // SCROLL MODE: UP/DOWN scroll, CENTER exits
+        if (buttonJustPressed[0]) { 
+          if (aiChatScroll > 0) { aiChatScroll--; aiUpdateCache(); }
+        }
+        if (buttonJustPressed[1]) { 
+          if (aiChatScroll < aiMsgCount - 1) { aiChatScroll++; aiUpdateCache(); }
+        }
+        if (buttonJustPressed[4]) { aiScrollMode = false; }
+      } else {
+        // NAV MODE
+        if (buttonJustPressed[0]) { // UP
+          if (aiCursor == 0) aiCursor = -2; // chat -> back
+          else if (aiCursor == 1 || aiCursor == 2) aiCursor = 0; // input/send -> chat
+        }
+        if (buttonJustPressed[1]) { // DOWN
+          if (aiCursor == -2 || aiCursor == -1) aiCursor = 0; // header -> chat
+          else if (aiCursor == 0) aiCursor = 1; // chat -> input
+        }
+        if (buttonJustPressed[2]) { // LEFT
+          if (aiCursor == -1) aiCursor = -2; // C -> back
+          else if (aiCursor == 2) aiCursor = 1; // send -> input
+        }
+        if (buttonJustPressed[3]) { // RIGHT
+          if (aiCursor == -2) aiCursor = -1; // back -> C
+          else if (aiCursor == 1) aiCursor = 2; // input -> send
+        }
+        if (buttonJustPressed[4]) { // CENTER
+          if (aiCursor == -2) { // Back
+            startAnimation(SCREEN_MENU, 64);
+          } else if (aiCursor == -1) { // Clear
+            aiClearChat();
+          } else if (aiCursor == 0) { // Enter scroll mode
+            aiScrollMode = true;
+          } else if (aiCursor == 1) { // Open keyboard
+            kbInputBuffer = aiInputText;
+            kbTextCursor = kbInputBuffer.length();
+            kbScrollOffset = 0;
+            kbReturnScreen = SCREEN_AI_CHAT;
+            kbCursorRow = 0; kbCursorCol = 0;
+            currentKBMode = KB_LOWER;
+            currentScreen = SCREEN_WIFI_KEYBOARD;
+          } else if (aiCursor == 2) { // Send
+            if (aiInputText.length() > 0) {
+              if (WiFi.status() != WL_CONNECTED) {
+                aiAddMessage("A:WiFi not connected");
+                aiChatScroll = max(0, aiMsgCount - 4);
+              } else if (aiMsgCount >= AI_MAX_MESSAGES) {
+                // Chat full
+              } else {
+                aiAddMessage("U:" + aiInputText);
+                aiInputText = "";
+                aiThinking = true;
+                aiThinkStart = millis();
+                aiResponseReady = false;
+                aiResponseError = false;
+                aiChatScroll = max(0, aiMsgCount - 4);
+                aiUpdateCache();
+                // Launch API task
+                xTaskCreate(aiSendTask, "AISend", 8192, NULL, 1, NULL);
+                startAnimation(SCREEN_AI_THINKING, -64);
+              }
+            }
+          }
+        }
+      }
+    }
+    else if (currentScreen == SCREEN_AI_THINKING) {
+      // No user input during thinking - just wait for polling
     }
 
     else if (currentScreen == SCREEN_WIFI_RESULTS) {
@@ -629,7 +1143,10 @@ void loop() {
       if (buttonJustPressed[1]) { if (wifiListIndex < wifiScanResults - 1) wifiListIndex++; }
       if (buttonJustPressed[2]) { if (wifiListIndex == -1) wifiListIndex = 0; }
       if (buttonJustPressed[4]) {
-        if (wifiListIndex == -1) { startAnimation(SCREEN_RADIO, 64); }
+        if (wifiListIndex == -1) { 
+          WiFi.disconnect(); 
+          startAnimation(SCREEN_RADIO, 64); 
+        }
         else {
           wifiTargetSSID = WiFi.SSID(wifiListIndex);
           wifiPassword   = findSavedPwd(wifiTargetSSID);
@@ -656,37 +1173,44 @@ void loop() {
         if (wifiPasswordCursor == 0) wifiPasswordCursor = 1;
       }
       if (buttonJustPressed[4]) {
-        if (wifiPasswordCursor == -1) startAnimation(SCREEN_WIFI_RESULTS, 64);
+        if (wifiPasswordCursor == -1) {
+          WiFi.disconnect();
+          startAnimation(SCREEN_WIFI_RESULTS, 64);
+        }
         else if (wifiPasswordCursor == 0) {
           kbInputBuffer = wifiPassword; currentKBMode = KB_LOWER;
           kbCursorRow = 0; kbCursorCol = 0;
+          kbTextCursor = kbInputBuffer.length();
+          kbScrollOffset = 0;
           kbReturnScreen = SCREEN_WIFI_PASSWORD;
           currentScreen = SCREEN_WIFI_KEYBOARD;
         } else if (wifiPasswordCursor == 1) {
-          wifiStatusMsg = "Connecting...";
+          WiFi.begin(wifiTargetSSID.c_str(), wifiPassword.c_str());
           wifiConnecting = true;
           wifiConnectStartTime = millis();
-          WiFi.begin(wifiTargetSSID.c_str(), wifiPassword.c_str());
+          wifiStatusMsg = "Connecting...";
         }
       }
       
       if (wifiConnecting) {
-        lastActivityTime = millis(); // keep screen on!
+        lastActivityTime = millis();
         if (WiFi.status() == WL_CONNECTED) {
           wifiConnecting = false;
           wifiRetryCount = 0;
+          WiFi.setSleep(true);
           saveCredential(wifiTargetSSID, wifiPassword);
           syncTimeWithNTP();
           wifiHomeCursor = 0;
           startAnimation(SCREEN_WIFI_HOME, -64);
-          lastActivityTime = millis(); // refresh timeout after connect
+          lastActivityTime = millis();
         } else if (WiFi.status() == WL_CONNECT_FAILED) {
           wifiConnecting = false;
           wifiRetryCount++;
+          WiFi.disconnect();
           if (wifiRetryCount >= 5) wifiStatusMsg = "Check signal/pass";
           else wifiStatusMsg = "Failed! Wrong PW?";
-        } else if (millis() - wifiConnectStartTime > 6000) {
-          // 6-second timeout
+        } else if (millis() - wifiConnectStartTime > 15000) {
+          // 15-second timeout (like cyberdeck)
           wifiConnecting = false;
           wifiRetryCount++;
           WiFi.disconnect();
@@ -706,14 +1230,40 @@ void loop() {
         else if (currentKBMode == KB_SYMBOL) key = kbSymbol[kbCursorRow][kbCursorCol];
         else key = kbLower[kbCursorRow][kbCursorCol];
         
-        if (strcmp(key, "EN") == 0) { wifiPassword = kbInputBuffer; currentScreen = kbReturnScreen; }
-        else if (strcmp(key, "<") == 0) { if (kbInputBuffer.length() > 0) kbInputBuffer.remove(kbInputBuffer.length() - 1); }
+        if (strcmp(key, "EN") == 0) { 
+          if (kbReturnScreen == SCREEN_RADIO_BLE) {
+            bleConfirmMode = 0; bleConfirmCursor = 0;
+            currentScreen = SCREEN_RADIO_BLE_CONFIRM; 
+          } else if (kbReturnScreen == SCREEN_AI_CHAT) {
+            aiInputText = kbInputBuffer;
+            if (aiInputText.length() > 128) aiInputText = aiInputText.substring(0, 128);
+            currentScreen = SCREEN_AI_CHAT;
+          } else {
+            wifiPassword = kbInputBuffer; 
+            currentScreen = kbReturnScreen; 
+          }
+        }
+        else if (strcmp(key, "CL") == 0) { // Cursor Left
+           if (kbTextCursor > 0) kbTextCursor--; 
+        }
+        else if (strcmp(key, "CR") == 0) { // Cursor Right
+           if (kbTextCursor < (int)kbInputBuffer.length()) kbTextCursor++; 
+        }
+        else if (strcmp(key, "BS") == 0) { // Backspace
+           if (kbTextCursor > 0 && kbInputBuffer.length() > 0) {
+             kbInputBuffer.remove(kbTextCursor - 1, 1);
+             kbTextCursor--;
+           } 
+        }
         else if (strcmp(key, "^") == 0) {
           if (currentKBMode == KB_LOWER) currentKBMode = KB_UPPER;
           else if (currentKBMode == KB_UPPER) currentKBMode = KB_SYMBOL;
           else currentKBMode = KB_LOWER;
         }
-        else kbInputBuffer += String(key);
+        else {
+           kbInputBuffer = kbInputBuffer.substring(0, kbTextCursor) + String(key) + kbInputBuffer.substring(kbTextCursor);
+           kbTextCursor += String(key).length();
+        }
       }
     }
     else if (currentScreen == SCREEN_WIFI_HOME) {
@@ -738,11 +1288,15 @@ void loop() {
       if (buttonJustPressed[2]) wifiToggleCursor = 0;
       if (buttonJustPressed[3]) wifiToggleCursor = 1;
       if (buttonJustPressed[4]) {
-        if (wifiToggleCursor == 0) { WiFi.disconnect(); WiFi.mode(WIFI_OFF); }
+        if (wifiToggleCursor == 0) { 
+          wifiEnabled = false; 
+          WiFi.disconnect(); 
+          WiFi.mode(WIFI_OFF); 
+        }
         startAnimation(SCREEN_RADIO, 64);
       }
     }
-    else if (currentScreen == SCREEN_RADIO_BLE || currentScreen == SCREEN_RADIO_ESPNOW || currentScreen == SCREEN_RADIO_POWER) {
+    else if (currentScreen == SCREEN_RADIO_ESPNOW) {
       if (buttonJustPressed[4]) startAnimation(SCREEN_RADIO, 64);
     }
 
@@ -799,42 +1353,63 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_WIFI_KEYBOARD) drawWifiKeyboard();
   else if (screen == SCREEN_WIFI_HOME) drawWifiHome(yOffset);
   else if (screen == SCREEN_WIFI_TOGGLE_CONFIRM) drawWifiToggleConfirm(yOffset);
-  else if (screen == SCREEN_RADIO_BLE) drawRadioStub(yOffset, "Bluetooth");
+  else if (screen == SCREEN_RADIO_BLE) drawRadioBleHome(yOffset);
+  else if (screen == SCREEN_RADIO_BLE_CONFIRM) drawBleConfirm(yOffset);
   else if (screen == SCREEN_RADIO_ESPNOW) drawRadioStub(yOffset, "ESP-NOW");
-  else if (screen == SCREEN_RADIO_POWER) drawRadioStub(yOffset, "Power Mode");
+  else if (screen == SCREEN_POWER_HOME) drawPowerHome(yOffset);
+  else if (screen == SCREEN_WIFI_AUTO_CONFIRM) drawWifiAutoConfirm(yOffset);
+  else if (screen == SCREEN_ESPNOW_AUTO_CONFIRM) drawEspNowAutoConfirm(yOffset);
+  else if (screen == SCREEN_POWER_MODE) drawPowerModeSelection(yOffset);
+  else if (screen == SCREEN_POWER_MODE_HELP) drawPowerModeHelp(yOffset);
+  else if (screen == SCREEN_ECO_EXIT_CONFIRM) drawEcoExitConfirm(yOffset);
   else if (screen == SCREEN_WIFI_NTP) drawWifiNTP(yOffset);
+  else if (screen == SCREEN_AI_CHAT) drawAiChat(yOffset);
+  else if (screen == SCREEN_AI_THINKING) drawAiThinking(yOffset);
 }
 
 void drawHeader(int yOffset, const char* appName, bool backFocused) {
   // Always draw the status bar separating line at the top
   display.drawFastHLine(0, 12 + yOffset, 128, SSD1306_WHITE);
 
+  int currentIconX = (appName == nullptr) ? 4 : 28; // Dynamic placement
+  int iconY = 2 + yOffset;
+
   // Draw WiFi icon if connected (only on Home and Menu)
   if (WiFi.status() == WL_CONNECTED && (currentScreen == SCREEN_WATCHFACE || currentScreen == SCREEN_MENU)) {
-    int wx = (appName == nullptr) ? 4 : 28; // Left aligned (after back arrow if present)
-    int wy = 2 + yOffset;
-    display.drawPixel(wx+3, wy+6, SSD1306_WHITE);
-    display.drawPixel(wx+4, wy+6, SSD1306_WHITE);
-    display.drawPixel(wx+2, wy+4, SSD1306_WHITE);
-    display.drawPixel(wx+3, wy+3, SSD1306_WHITE);
-    display.drawPixel(wx+4, wy+3, SSD1306_WHITE);
-    display.drawPixel(wx+5, wy+4, SSD1306_WHITE);
-    display.drawPixel(wx+0, wy+2, SSD1306_WHITE);
-    display.drawPixel(wx+1, wy+1, SSD1306_WHITE);
-    display.drawPixel(wx+2, wy+0, SSD1306_WHITE);
-    display.drawPixel(wx+5, wy+0, SSD1306_WHITE);
-    display.drawPixel(wx+6, wy+1, SSD1306_WHITE);
-    display.drawPixel(wx+7, wy+2, SSD1306_WHITE);
+    display.drawPixel(currentIconX+3, iconY+6, SSD1306_WHITE);
+    display.drawPixel(currentIconX+4, iconY+6, SSD1306_WHITE);
+    display.drawPixel(currentIconX+2, iconY+4, SSD1306_WHITE);
+    display.drawPixel(currentIconX+3, iconY+3, SSD1306_WHITE);
+    display.drawPixel(currentIconX+4, iconY+3, SSD1306_WHITE);
+    display.drawPixel(currentIconX+5, iconY+4, SSD1306_WHITE);
+    display.drawPixel(currentIconX+0, iconY+2, SSD1306_WHITE);
+    display.drawPixel(currentIconX+1, iconY+1, SSD1306_WHITE);
+    display.drawPixel(currentIconX+2, iconY+0, SSD1306_WHITE);
+    display.drawPixel(currentIconX+5, iconY+0, SSD1306_WHITE);
+    display.drawPixel(currentIconX+6, iconY+1, SSD1306_WHITE);
+    display.drawPixel(currentIconX+7, iconY+2, SSD1306_WHITE);
     
     // Draw Internet signal bars icon if internet is OK (right next to WiFi)
     if (internetOK) {
-      int tx = wx + 11; // 11px to the right of wifi
-      int ty = 2 + yOffset;
+      int tx = currentIconX + 11; // 11px to the right of wifi
+      int ty = iconY;
       display.drawFastVLine(tx + 0, ty + 6, 2, SSD1306_WHITE);
       display.drawFastVLine(tx + 2, ty + 4, 4, SSD1306_WHITE);
       display.drawFastVLine(tx + 4, ty + 2, 6, SSD1306_WHITE);
       display.drawFastVLine(tx + 6, ty + 0, 8, SSD1306_WHITE);
+      currentIconX += 20; // Move global cursor for next icons
+    } else {
+      currentIconX += 11;
     }
+  }
+
+  // Draw Bluetooth icon if connected
+  if (bleConnected && (currentScreen == SCREEN_WATCHFACE || currentScreen == SCREEN_MENU)) {
+    display.drawFastVLine(currentIconX + 3, iconY + 0, 9, SSD1306_WHITE);
+    display.drawLine(currentIconX + 1, iconY + 2, currentIconX + 5, iconY + 6, SSD1306_WHITE);
+    display.drawLine(currentIconX + 1, iconY + 6, currentIconX + 5, iconY + 2, SSD1306_WHITE);
+    display.drawLine(currentIconX + 3, iconY + 0, currentIconX + 5, iconY + 2, SSD1306_WHITE);
+    display.drawLine(currentIconX + 3, iconY + 8, currentIconX + 5, iconY + 6, SSD1306_WHITE);
   }
 
   if (appName != nullptr) {
@@ -914,10 +1489,13 @@ void drawMenu(int yOffset) {
   
   int itemH = 12;
   int listY = 16 + yOffset;
-
   
-  for (int i = 0; i < NUM_MENU_ITEMS; i++) {
-    int y = listY + (i * itemH);
+  // Scrolling logic: only show 4 items at a time
+  int startIdx = (menuIndex < 4) ? 0 : menuIndex - 3;
+  int endIdx = min(startIdx + 4, (int)NUM_MENU_ITEMS);
+
+  for (int i = startIdx; i < endIdx; i++) {
+    int y = listY + ((i - startIdx) * itemH);
     
     if (i == menuIndex) {
       display.fillRect(0, y-1, 128, itemH, SSD1306_WHITE);
@@ -1116,6 +1694,52 @@ void drawBoxedCenteredText(Adafruit_SSD1306 &d, const char* text, int x, int y, 
 // RADIO APP HELPERS
 // ============================================================
 
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      bleConnected = true;
+      bleRemoteDeviceName = "Connected"; 
+    };
+    void onDisconnect(BLEServer* pServer) {
+      bleConnected = false;
+      bleRemoteDeviceName = "None";
+      BLEDevice::startAdvertising();
+    }
+};
+
+void initBLE() {
+  prefs.begin("ble_settings", true);
+  bleDeviceName = prefs.getString("name", "Ashutosh's Smartwatch");
+  bleSettingAccess = prefs.getBool("access", false);
+  prefs.end();
+
+  BLEDevice::init(bleDeviceName.c_str());
+  pBleServer = BLEDevice::createServer();
+  pBleServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pBleServer->createService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+  pBleNameCharacteristic = pService->createCharacteristic(
+                             "beb5483e-36e1-4688-b7f5-ea07361b26a8",
+                             BLECharacteristic::PROPERTY_READ |
+                             BLECharacteristic::PROPERTY_WRITE
+                           );
+  pBleNameCharacteristic->setValue(bleDeviceName.c_str());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+}
+
+void saveBleSettings() {
+  prefs.begin("ble_settings", false);
+  prefs.putString("name", bleDeviceName);
+  prefs.putBool("access", bleSettingAccess);
+  prefs.end();
+}
+
 void loadCredentials() {
   prefs.begin("wifi_creds", true);
   savedNetCount = prefs.getInt("count", 0);
@@ -1127,6 +1751,12 @@ void loadCredentials() {
 }
 
 void saveCredential(String ssid, String pwd) {
+  // Update last connected SSID
+  lastConnectedSSID = ssid;
+  prefs.begin("powermode", false);
+  prefs.putString("lastSSID", lastConnectedSSID);
+  prefs.end();
+
   // Check if already saved
   for (int i = 0; i < savedNetCount; i++) {
     if (savedSSIDs[i] == ssid) { savedPWDs[i] = pwd; goto writeAll; }
@@ -1179,6 +1809,7 @@ void syncTimeWithNTP() {
 
 void internetPinger1(void *p) {
   for (;;) {
+    if (!displayOn) { vTaskDelay(pdMS_TO_TICKS(5000)); continue; } 
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient h; h.setConnectTimeout(1200); h.setTimeout(1800);
       h.begin("http://www.gstatic.com/generate_204");
@@ -1189,6 +1820,7 @@ void internetPinger1(void *p) {
 }
 void internetPinger2(void *p) {
   for (;;) {
+    if (!displayOn) { vTaskDelay(pdMS_TO_TICKS(5000)); continue; } 
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient h; h.setConnectTimeout(1200); h.setTimeout(1800);
       h.begin("http://clients3.google.com/generate_204");
@@ -1199,6 +1831,7 @@ void internetPinger2(void *p) {
 }
 void internetPinger3(void *p) {
   for (;;) {
+    if (!displayOn) { vTaskDelay(pdMS_TO_TICKS(5000)); continue; } 
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient h; h.setConnectTimeout(1200); h.setTimeout(1800);
       h.begin("http://cp.cloudflare.com/generate_204");
@@ -1209,6 +1842,7 @@ void internetPinger3(void *p) {
 }
 void internetPinger4(void *p) {
   for (;;) {
+    if (!displayOn) { vTaskDelay(pdMS_TO_TICKS(5000)); continue; } 
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient h; h.setConnectTimeout(1200); h.setTimeout(1800);
       h.begin("http://edge-http.microsoft.com/captiveportal/generate_204");
@@ -1219,6 +1853,7 @@ void internetPinger4(void *p) {
 }
 void internetPinger5(void *p) {
   for (;;) {
+    if (!displayOn) { vTaskDelay(pdMS_TO_TICKS(5000)); continue; } 
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient h; h.setConnectTimeout(1200); h.setTimeout(1800);
       h.begin("http://connect.rom.miui.com/generate_204");
@@ -1300,33 +1935,44 @@ void drawWifiResults(int yOffset) {
     drawCenteredText(display, "No networks found", 30 + yOffset, 1);
     return;
   }
-  // Show up to 4 results with scrolling
-  int visibleItems = 4;
-  if (wifiListIndex > -1 && wifiListIndex < wifiListScroll) wifiListScroll = wifiListIndex;
-  if (wifiListIndex >= wifiListScroll + visibleItems) wifiListScroll = wifiListIndex - visibleItems + 1;
+  // Visible item area: y=16 to y=63, 12px each = 4 items
+  const int visibleItems = 4;
+  // Keep scroll window tracking current selection
+  if (wifiListIndex > -1) {
+    if (wifiListIndex < wifiListScroll) wifiListScroll = wifiListIndex;
+    if (wifiListIndex >= wifiListScroll + visibleItems) wifiListScroll = wifiListIndex - visibleItems + 1;
+  }
   for (int i = 0; i < visibleItems; i++) {
     int netIdx = wifiListScroll + i;
     if (netIdx >= wifiScanResults) break;
     int y = 16 + (i * 12) + yOffset;
     bool selected = (wifiListIndex == netIdx);
     if (selected) {
-      display.fillRect(0, y - 1, 124, 11, SSD1306_WHITE);
+      display.fillRect(0, y - 1, 122, 12, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
     } else {
       display.setTextColor(SSD1306_WHITE);
     }
     display.setCursor(4, y);
     String ssid = WiFi.SSID(netIdx);
-    if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "~";
+    if (ssid.length() == 0) ssid = "(hidden)";
+    if (ssid.length() > 17) ssid = ssid.substring(0, 16) + "~";
     display.print(ssid);
+    // RSSI strength indicator (right side using 1-3 block chars)
+    int rssi = WiFi.RSSI(netIdx);
+    int bars = (rssi > -60) ? 3 : (rssi > -75) ? 2 : 1;
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(118, y);
+    display.print(bars == 3 ? ":" : bars == 2 ? "." : ",");
   }
   display.setTextColor(SSD1306_WHITE);
   display.setTextWrap(true);
-  // Scroll indicator
+  // Scrollbar on right edge
   if (wifiScanResults > visibleItems) {
-    int sbH = (visibleItems * 48) / wifiScanResults;
-    int sbY = 16 + (wifiListScroll * (48 - sbH) / (wifiScanResults - visibleItems));
-    display.drawFastVLine(126, 16 + yOffset, 48, SSD1306_WHITE);
+    int trackH = 48;
+    int sbH = max(4, (visibleItems * trackH) / wifiScanResults);
+    int sbY = 16 + ((wifiListScroll * (trackH - sbH)) / (wifiScanResults - visibleItems));
+    display.drawFastVLine(126, 16 + yOffset, trackH, SSD1306_WHITE);
     display.fillRect(125, sbY + yOffset, 3, sbH, SSD1306_WHITE);
   }
 }
@@ -1364,12 +2010,27 @@ void drawWifiKeyboard() {
   display.setTextColor(SSD1306_WHITE);
   display.drawRect(0, 0, 128, 12, SSD1306_WHITE);
   display.setCursor(4, 3);
-  String disp = kbInputBuffer;
-  // Show last 17 chars
-  if (disp.length() > 17) disp = disp.substring(disp.length() - 17);
-  if (disp.length() == 0) { display.setTextColor(0x5555); display.print("Type password..."); }
-  else display.print(disp);
-  display.setTextColor(SSD1306_WHITE);
+  
+  // Track scroll correctly so cursor stays on screen (max ~17 chars visible)
+  if (kbTextCursor < kbScrollOffset) kbScrollOffset = kbTextCursor;
+  if (kbTextCursor > kbScrollOffset + 17) kbScrollOffset = kbTextCursor - 17;
+  
+  String disp = kbInputBuffer.substring(kbScrollOffset);
+  if (disp.length() > 18) disp = disp.substring(0, 18);
+  
+  if (kbInputBuffer.length() == 0) { 
+    display.setTextColor(0x5555); display.print("Type password..."); 
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.print(disp);
+  }
+  
+  // Draw blinking cursor line
+  if ((millis() / 500) % 2 == 0) {
+    int cursorCharPos = kbTextCursor - kbScrollOffset;
+    int cursorPx = 4 + (cursorCharPos * 6); // roughly 6px per char (5x7 font + 1px gap)
+    display.drawFastVLine(cursorPx, 2, 9, SSD1306_WHITE);
+  }
 
   // Keyboard rows (liquid layout to fill strictly bottom 50px area constraints)
   for (int r = 0; r < 4; r++) {
@@ -1390,6 +2051,72 @@ void drawWifiKeyboard() {
   }
 }
 
+void drawRadioBleHome(int yOffset) {
+  drawHeader(yOffset, "Bluetooth", (bleHomeCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  
+  if (!bleConnected) {
+    drawCenteredText(display, "Bluetooth ON", 18 + yOffset, 1);
+    drawCenteredText(display, "Device not connected", 30 + yOffset, 1);
+    
+    int okY = 48 + yOffset;
+    bool okSelected = (bleHomeCursor == 0);
+    if (okSelected) {
+      display.fillRect(46, okY - 1, 36, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.drawRect(46, okY - 1, 36, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_WHITE);
+    }
+    drawCenteredText(display, "OK", okY + 1, 1);
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    // Connected UI
+    int startY = 16 + yOffset;
+    display.setCursor(4, startY);
+    display.print("Device: "); 
+    String remote = bleRemoteDeviceName;
+    if (remote.length() > 9) remote = remote.substring(0, 8) + "..";
+    display.print(remote);
+    
+    // Interactive rows
+    for (int i = 0; i < 2; i++) {
+      int rowY = 26 + (i * 12) + yOffset;
+      if (bleHomeCursor == i) {
+        display.fillRect(0, rowY - 1, 128, 11, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+      }
+      display.setCursor(4, rowY);
+      if (i == 0) {
+        display.print("Name: "); 
+        String dn = bleDeviceName;
+        if (dn.length() > 10) dn = dn.substring(0, 9) + "..";
+        display.print(dn);
+      } else if (i == 1) {
+        display.print("Setting access: "); display.print(bleSettingAccess ? "YES" : "NO");
+      }
+      display.setTextColor(SSD1306_WHITE);
+    }
+  }
+}
+
+void drawBleConfirm(int yOffset) {
+  drawHeader(yOffset, "Bluetooth", (bleConfirmCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  
+  const char* msg = "";
+  if (bleConfirmMode == 0) msg = "Change Name?";
+  else if (bleConfirmMode == 1) msg = "Disconnect?";
+  else if (bleConfirmMode == 2) msg = "Forget Device?";
+  else if (bleConfirmMode == 3) msg = bleSettingAccess ? "Turn OFF access?" : "Turn ON access?";
+  
+  drawCenteredText(display, msg, 22 + yOffset, 1);
+  
+  // Side-by-side YES / NO boxed buttons (same style as WiFi confirm)
+  drawBoxedCenteredText(display, "YES", 10, 44 + yOffset, 46, 13, (bleConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  72, 44 + yOffset, 46, 13, (bleConfirmCursor == 1));
+}
+
 void drawWifiHome(int yOffset) {
   drawHeader(yOffset, "WiFi", (wifiHomeCursor == -1));
   display.setTextColor(SSD1306_WHITE);
@@ -1404,7 +2131,7 @@ void drawWifiHome(int yOffset) {
   display.print(ssid);
   display.setTextWrap(true);
   // Interactive menu items
-  const char* opts[] = {"WiFi: ON", "SYNC TIME", "FORGET NETWORK"};
+  const char* opts[] = {"WiFi: ON", "Sync Time", "Forget Network"};
   for (int i = 0; i < 3; i++) {
     int y = 36 + (i * 10) + yOffset;
     bool sel = (wifiHomeCursor == i);
@@ -1457,3 +2184,447 @@ void drawRadioStub(int yOffset, const char* name) {
   drawCenteredText(display, "Coming Soon", 40 + yOffset, 1);
 }
 
+void drawPowerHome(int yOffset) {
+  drawHeader(yOffset, "Power Mode", (powerHomeCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  
+  const char* opts[] = {"WiFi Auto On:", "ESP-NOW Auto:", "Eco Mode"};
+  for (int i = 0; i < 3; i++) {
+    int y = 16 + (i * 12) + yOffset;
+    if (powerHomeCursor == i) {
+      display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(4, y);
+    display.print(opts[i]);
+    
+    // Show YES/NO values for auto-on options
+    if (i == 0) {
+      display.setCursor(90, y);
+      display.print(wifiAutoOn ? "YES" : "NO");
+    } else if (i == 1) {
+      display.setCursor(90, y);
+      display.print(espNowAutoOn ? "YES" : "NO");
+    }
+  }
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void drawWifiAutoConfirm(int yOffset) {
+  drawHeader(yOffset, "Power Mode", (wifiConfirmCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Turn WiFi", 18 + yOffset, 1);
+  drawCenteredText(display, "Auto On?", 29 + yOffset, 1);
+  
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (wifiConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (wifiConfirmCursor == 1));
+}
+
+void drawEspNowAutoConfirm(int yOffset) {
+  drawHeader(yOffset, "Power Mode", (wifiConfirmCursor == -1)); // reusing cursor for simplicity
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Turn ESP-NOW", 18 + yOffset, 1);
+  drawCenteredText(display, "Auto On?", 29 + yOffset, 1);
+  
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (wifiConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (wifiConfirmCursor == 1));
+}
+
+void drawPowerModeSelection(int yOffset) {
+  drawHeader(yOffset, "Power Mode");
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Enable Eco", 22 + yOffset, 1);
+  drawCenteredText(display, "mode?", 33 + yOffset, 1);
+  // YES / HELP / NO buttons
+  drawBoxedCenteredText(display, "YES", 5, 48 + yOffset, 33, 13, (powerModeButtonCursor == 0));
+  drawBoxedCenteredText(display, "HELP", 47, 48 + yOffset, 33, 13, (powerModeButtonCursor == 1));
+  drawBoxedCenteredText(display, "NO", 89, 48 + yOffset, 33, 13, (powerModeButtonCursor == 2));
+}
+
+void drawPowerModeHelp(int yOffset) {
+  drawHeader(yOffset, "Power Mode", false);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Display help text
+  display.setCursor(4, 16 + yOffset);
+  display.setTextSize(1);
+  display.println("Eco Mode: Ultra low");
+  display.println("power, 31-day battery");
+  display.println("5s sleep cycles with");
+  display.println("time-only display");
+  display.println("");
+  display.println("Normal: Full features");
+  
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void drawEcoExitConfirm(int yOffset) {
+  drawHeader(yOffset, "Eco Mode", (ecoExitConfirmCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Exit Eco Mode?", 22 + yOffset, 1);
+  // YES / NO
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (ecoExitConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (ecoExitConfirmCursor == 1));
+}
+
+void wifiBackgroundTask(void *pvParameters) {
+  for (;;) {
+    // Wait 10 seconds between checks as requested
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    // Only run if WiFi Auto On or Manual WiFi is enabled, and not in Eco Mode
+    if ((wifiAutoOn || wifiEnabled) && !ecoModeActive) {
+      
+      // No need to run if already connected or if a scan/connection is currently in progress via UI
+      if (WiFi.status() == WL_CONNECTED || wifiConnecting || WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+        continue;
+      }
+
+      // Skip if we are currently in a critical WiFi or AI screen to avoid conflicts.
+      // We skip SCREEN_RADIO_WIFI and more to ensure manual scans/AI tasks are priority.
+      if (currentScreen == SCREEN_WIFI_SCANNING || currentScreen == SCREEN_WIFI_RESULTS || 
+          currentScreen == SCREEN_WIFI_PASSWORD || currentScreen == SCREEN_WIFI_KEYBOARD ||
+          currentScreen == SCREEN_RADIO_WIFI || currentScreen == SCREEN_AI_CHAT || 
+          currentScreen == SCREEN_AI_THINKING) {
+        continue;
+      }
+
+      // Ensure WiFi is in STA mode and turned on
+      if (WiFi.getMode() != WIFI_STA) {
+        WiFi.mode(WIFI_STA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+
+      // Perform a scan to find available networks
+      int n = WiFi.scanNetworks();
+      if (n > 0) {
+        int bestIdx = -1;
+        bool lastFound = false;
+
+        for (int i = 0; i < n; i++) {
+          String ssid = WiFi.SSID(i);
+          String pwd = findSavedPwd(ssid);
+          
+          if (pwd.length() > 0) {
+            // If this is the last connected SSID, we found our top priority
+            if (lastConnectedSSID.length() > 0 && ssid == lastConnectedSSID) {
+              bestIdx = i;
+              lastFound = true;
+              break; 
+            }
+            // Otherwise, keep track of the first saved network we found
+            if (bestIdx == -1) {
+              bestIdx = i;
+            }
+          }
+        }
+
+        // Connect if a saved network was found
+        if (bestIdx != -1) {
+          String targetSSID = WiFi.SSID(bestIdx);
+          String targetPWD = findSavedPwd(targetSSID);
+          
+          WiFi.begin(targetSSID.c_str(), targetPWD.c_str());
+          
+          // Wait up to 10 seconds for connection
+          unsigned long start = millis();
+          while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+          }
+          
+          if (WiFi.status() == WL_CONNECTED) {
+            lastConnectedSSID = targetSSID;
+            prefs.begin("powermode", false);
+            prefs.putString("lastSSID", lastConnectedSSID);
+            prefs.end();
+            syncTimeWithNTP();
+          }
+        }
+      }
+      if (currentScreen != SCREEN_WIFI_RESULTS) WiFi.scanDelete();
+    }
+  }
+}
+
+// ============================================================
+// AI CHATBOT HELPERS (LittleFS-backed)
+// ============================================================
+
+int aiCountMessages() {
+  File f = LittleFS.open("/ai_chat.txt", "r");
+  if (!f) return 0;
+  int count = 0;
+  while (f.available()) {
+    f.readStringUntil('\n');
+    count++;
+  }
+  f.close();
+  return count;
+}
+
+void aiAddMessage(const String& msg) {
+  File f = LittleFS.open("/ai_chat.txt", "a");
+  if (f) {
+    f.println(msg);
+    f.close();
+    aiMsgCount++;
+  }
+}
+
+void aiClearChat() {
+  LittleFS.remove("/ai_chat.txt");
+  aiMsgCount = 0;
+  aiChatScroll = 0;
+}
+
+String aiGetMessage(int index) {
+  File f = LittleFS.open("/ai_chat.txt", "r");
+  if (!f) return "";
+  int cur = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (cur == index) { f.close(); return line; }
+    cur++;
+  }
+  f.close();
+  return "";
+}
+
+// ============================================================
+// AI CHATBOT DRAW FUNCTIONS
+// ============================================================
+
+void drawAiChat(int yOffset) {
+  // --- Header: <-- (left) | "AI Chatbot" (center) | C (right) ---
+  display.drawFastHLine(0, 12 + yOffset, 128, SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Back button <--
+  if (aiCursor == -2) {
+    display.fillRect(0, yOffset, 24, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(2, 2 + yOffset);
+  display.print("<--");
+
+  // Title "AI Chatbot" centered
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "AI Chatbot", 2 + yOffset, 1);
+
+  // Clear button "C" right side
+  if (aiCursor == -1) {
+    display.fillRect(116, yOffset, 12, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(119, 2 + yOffset);
+  display.print("C");
+  display.setTextColor(SSD1306_WHITE);
+
+  // --- Chat area: y=13 to y=50 (38px, ~4 lines of 9px) ---
+  int chatY = 13 + yOffset;
+  int chatH = 38;
+  int lineH = 9;
+  int maxVisibleLines = chatH / lineH; // 4 lines
+
+  // Highlight chat area if focused
+  if (aiCursor == 0 && !aiScrollMode) {
+    display.drawRect(0, chatY, 128, chatH, SSD1306_WHITE);
+  }
+  if (aiScrollMode) {
+    // Draw scroll indicator
+    display.fillRect(124, chatY, 4, chatH, SSD1306_BLACK);
+    if (aiMsgCount > 0) {
+      int sbH = max(4, (maxVisibleLines * chatH) / max(1, aiMsgCount));
+      int sbY = chatY + ((aiChatScroll * (chatH - sbH)) / max(1, aiMsgCount - 1));
+      display.fillRect(125, sbY, 3, sbH, SSD1306_WHITE);
+    }
+  }
+
+  // Check for chat full message
+  if (aiMsgCount >= AI_MAX_MESSAGES) {
+    drawCenteredText(display, "Chat full!", chatY + 8, 1);
+    drawCenteredText(display, "Press C to clear", chatY + 20, 1);
+  } else if (aiMsgCount == 0) {
+    drawCenteredText(display, "No messages yet", chatY + 14, 1);
+  } else {
+    // Render messages from aiCache
+    int drawY = chatY + 1;
+    display.setTextWrap(false);
+    for (int i = 0; i < 5 && (aiChatScroll + i) < aiMsgCount && drawY < chatY + chatH - 2; i++) {
+      String msg = aiCache[i];
+      if (msg.length() == 0) continue;
+      
+      bool isUser = msg.startsWith("U:");
+      String prefix = isUser ? "Me:" : "AI:";
+      String content = msg.substring(2);
+      String fullText = prefix + content;
+      
+      // Word-wrap and render
+      int pos = 0;
+      int maxChars = 21;
+      bool firstLine = true;
+      while (pos < (int)fullText.length() && drawY < chatY + chatH - 2) {
+        int remaining = fullText.length() - pos;
+        int lineLen = min(remaining, maxChars);
+        
+        // Word wrap: find last space
+        if (remaining > maxChars) {
+          int lastSpace = -1;
+          for (int j = pos; j < pos + lineLen; j++) {
+            if (fullText[j] == ' ') lastSpace = j;
+          }
+          if (lastSpace > pos) lineLen = lastSpace - pos + 1;
+        }
+        
+        display.setCursor(2, drawY);
+        display.print(fullText.substring(pos, pos + lineLen));
+        pos += lineLen;
+        drawY += lineH;
+      }
+      drawY += 1; // Gap between messages
+    }
+    display.setTextWrap(true);
+  }
+
+  // --- Bottom bar: input box + SEND button at y=52 ---
+  int barY = 52 + yOffset;
+
+  // Input box
+  if (aiCursor == 1) {
+    display.fillRect(0, barY, 99, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.drawRect(0, barY, 99, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(3, barY + 2);
+  if (aiInputText.length() == 0) {
+    display.print("Type message...");
+  } else {
+    String disp = aiInputText;
+    if (disp.length() > 15) disp = disp.substring(disp.length() - 15);
+    display.print(disp);
+  }
+
+  // SEND button
+  display.setTextColor(SSD1306_WHITE);
+  drawBoxedCenteredText(display, "SEND", 101, barY, 27, 12, (aiCursor == 2));
+}
+
+void drawAiThinking(int yOffset) {
+  // Cleaner thinking screen without header
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "AI Thinking", 26 + yOffset, 1);
+  
+  // Animated dots
+  int dots = ((millis() - aiThinkStart) / 400) % 4;
+  String dotStr = "";
+  for (int i = 0; i < dots; i++) dotStr += ".";
+  drawCenteredText(display, dotStr, 38 + yOffset, 1);
+}
+
+// ============================================================
+// AI CHATBOT API TASK
+// ============================================================
+
+void aiSendTask(void* param) {
+  // Build context from last 6 messages
+  int contextCount = min(6, aiMsgCount);
+  int startIdx = aiMsgCount - contextCount;
+  
+  String messages = "[{\"role\":\"system\",\"content\":\"You are a helpful AI assistant on a smartwatch. Keep responses very short (under 100 chars) since the display is tiny (128x64 pixels). Be concise and direct.\"}";
+  
+  for (int i = startIdx; i < aiMsgCount; i++) {
+    String msg = aiGetMessage(i);
+    if (msg.length() < 3) continue;
+    String role = msg.startsWith("U:") ? "user" : "assistant";
+    String content = msg.substring(2);
+    content.replace("\\", "\\\\");
+    content.replace("\"", "\\\"");
+    content.replace("\n", " ");
+    messages += ",{\"role\":\"" + role + "\",\"content\":\"" + content + "\"}";
+  }
+  messages += "]";
+  
+  String payload = "{\"model\":\"llama-3.3-70b-versatile\",\"messages\":" + messages + ",\"max_tokens\":150}";
+  
+  vTaskDelay(pdMS_TO_TICKS(500)); // Let WiFi settle
+  
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip cert verification for embedded
+  
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(7000);
+  http.begin(client, "https://api.groq.com/openai/v1/chat/completions");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("User-Agent", "ESP32-Smartwatch/1.0");
+  http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
+  
+  int code = http.POST(payload);
+  if (code == 200) {
+    String response = http.getString();
+    // Parse choices[0].message.content
+    int choicesIdx = response.indexOf("\"choices\"");
+    if (choicesIdx != -1) {
+      int contentIdx = response.indexOf("\"content\"", choicesIdx);
+      if (contentIdx != -1) {
+        int colonIdx = response.indexOf(":", contentIdx + 9);
+        if (colonIdx != -1) {
+          int qStart = response.indexOf("\"", colonIdx + 1);
+          if (qStart != -1) {
+            qStart++;
+            int qEnd = qStart;
+            while (qEnd < (int)response.length()) {
+              if (response[qEnd] == '\\') { qEnd += 2; continue; }
+              if (response[qEnd] == '"') break;
+              qEnd++;
+            }
+            aiResponse = response.substring(qStart, qEnd);
+            aiResponse.replace("\\n", " ");
+            aiResponse.replace("\\\"", "\"");
+            aiResponse.replace("\\\\", "\\");
+            aiResponseReady = true;
+          }
+        }
+      }
+    }
+    if (!aiResponseReady) aiResponseError = true;
+  } else {
+    // Better error reporting: show the actual HTTP code
+    aiResponse = "Error: " + String(code);
+    aiResponseReady = true; 
+  }
+  http.end();
+  vTaskDelete(NULL);
+}
+
+void aiUpdateCache() {
+  // Clear cache first
+  for (int i = 0; i < 5; i++) aiCache[i] = "";
+  
+  if (aiMsgCount == 0) return;
+
+  File f = LittleFS.open("/ai_chat.txt", "r");
+  if (!f) return;
+
+  int curIdx = 0;
+  int cacheIdx = 0;
+  while (f.available() && cacheIdx < 5) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (curIdx >= aiChatScroll) {
+      aiCache[cacheIdx++] = line;
+    }
+    curIdx++;
+  }
+  f.close();
+  aiCacheScrollUsed = aiChatScroll;
+}
