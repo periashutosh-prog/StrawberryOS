@@ -1,11 +1,6 @@
 // StrawberryOS - A smartwatch OS for ESP32
 // Copyright (C) 2026 Ashutosh
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
 // See the LICENSE file for more details.
 #include <Arduino.h>
 #include <Wire.h>
